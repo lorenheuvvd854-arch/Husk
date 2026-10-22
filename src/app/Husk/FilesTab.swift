@@ -167,6 +167,7 @@ struct DirectoryView: View {
     private func icon(for name: String) -> String {
         let n = name.lowercased()
         if n.hasSuffix(".apk") { return "shippingbox.fill" }
+        if n.hasSuffix(".exe") || n.hasSuffix(".msi") { return "macwindow" }
         if n.hasSuffix(".png") || n.hasSuffix(".jpg") || n.hasSuffix(".jpeg")
             || n.hasSuffix(".webp") { return "photo" }
         if n.hasSuffix(".mp4") || n.hasSuffix(".mkv") { return "film" }

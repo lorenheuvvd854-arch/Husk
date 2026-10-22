@@ -30,6 +30,10 @@ final class IncomingFiles: ObservableObject {
     }
 
     static let extensions: Set<String> = ["apk", "xapk", "apkm", "apks", "obb"]
+    /// Windows programs: they run in Android, through Winlator, never in the Translation Layer, so they skip the question.
+    static let windowsExtensions: Set<String> = ["exe", "msi"]
+    /// Windows programs held until Android is up to take them.
+    @Published private(set) var forWindows: [URL] = []
 
     /// Copies under way, said in one line while they last.
     @Published private(set) var preparing: String?
@@ -37,6 +41,7 @@ final class IncomingFiles: ObservableObject {
     /// A URL iOS opened Husk with. Anything that is not an APK or a bundle of them is left alone (husk:// links are not files).
     func receive(_ url: URL) {
         if url.isFileURL, url.pathExtension.lowercased() == "pkg" { installPS4Packages([url]); return }
+        if url.isFileURL, Self.windowsExtensions.contains(url.pathExtension.lowercased()) { takeWindows([url]); return }
         guard url.isFileURL, Self.extensions.contains(url.pathExtension.lowercased()) else { return }
         take([url]) { copies in
             self.gathering += copies
@@ -60,6 +65,8 @@ final class IncomingFiles: ObservableObject {
         let packages = urls.filter { $0.pathExtension.lowercased() == "pkg" }
             + urls.filter { !Self.isPS4GameFolder($0) }.flatMap(Self.packages(in:))
         if !packages.isEmpty { installPS4Packages(packages) }
+        let windows = urls.filter { Self.windowsExtensions.contains($0.pathExtension.lowercased()) }
+        if !windows.isEmpty { takeWindows(windows) }
         let wanted = urls.filter { Self.extensions.contains($0.pathExtension.lowercased()) }
         guard !wanted.isEmpty else { return }
         take(wanted) { self.waiting += $0 }
@@ -231,8 +238,27 @@ final class IncomingFiles: ObservableObject {
         installForAndroidIfReady()
     }
 
+    /// Windows programs go to Android as soon as it is up, where Winlator runs them.
+    private func takeWindows(_ urls: [URL]) {
+        take(urls) { copies in
+            self.forWindows += copies
+            if !AndroidHost.shared.isReady {
+                AndroidHost.shared.say("Waiting for Android",
+                                       "Windows programs run in Android through Winlator. It opens once Android has started.")
+            }
+            self.installForAndroidIfReady()
+        }
+    }
+
     func installForAndroidIfReady() {
-        guard AndroidHost.shared.isReady, AndroidHost.shared.busy == nil, !forAndroid.isEmpty else { return }
+        guard AndroidHost.shared.isReady, AndroidHost.shared.busy == nil else { return }
+        if forAndroid.isEmpty, !forWindows.isEmpty {
+            let files = forWindows
+            forWindows = []
+            AndroidHost.shared.openWindowsPrograms(files)
+            return
+        }
+        guard !forAndroid.isEmpty else { return }
         let urls = forAndroid
         forAndroid = []
         // An expansion file is not a package: Android's installer would refuse the whole set over it

@@ -105,6 +105,16 @@ jobs:
             cp "$NEW_EXE" "$SAPP/Husk"
             plutil -replace HuskBuildCommit -string "rework-$SHORT" "$SAPP/Info.plist"
             plutil -replace HuskBuildDate -string "$(date -u '+%Y-%m-%d %H:%M UTC')" "$SAPP/Info.plist"
+            # The file types Husk opens come from this source tree, not from the release's plist.
+            python3 - "$(dirname "$NEW_EXE")/Info.plist" "$SAPP/Info.plist" <<'PY'
+          import plistlib, sys
+          built = plistlib.load(open(sys.argv[1], "rb"))
+          ours = plistlib.load(open(sys.argv[2], "rb"))
+          for key in ("CFBundleDocumentTypes", "UTImportedTypeDeclarations"):
+              if key in built:
+                  ours[key] = built[key]
+          plistlib.dump(ours, open(sys.argv[2], "wb"), fmt=plistlib.FMT_BINARY)
+          PY
 
             local ENT="$STAGE/entitlements.plist"
             cp src/app/Husk/Husk.entitlements "$ENT"

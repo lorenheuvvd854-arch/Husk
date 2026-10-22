@@ -1939,3 +1939,69 @@ final class AndroidHost: ObservableObject {
         }
     }
 }
+
+// MARK: - Windows programs
+
+extension AndroidHost {
+    /// Puts Windows programs in Android's Download/Windows (drive D:\Windows in Winlator), installs Winlator first if Android
+    /// has no copy of it, and opens it. Winlator cannot be told which program to run, so the person picks it there.
+    func openWindowsPrograms(_ files: [URL]) {
+        guard !files.isEmpty else { return }
+        busy = "Preparing \(files.count == 1 ? files[0].lastPathComponent : "\(files.count) Windows programs")…"
+        Task.detached { [weak self] in
+            let show: (String) -> Void = { text in Task { @MainActor in self?.busy = text } }
+            do {
+                switch AndroidHost.guestState() {
+                case .locked:            throw BridgeError.io("Android is locked. Unlock it and try again.")
+                case .unreachable(let why): throw BridgeError.io(why)
+                case .asleep:            _ = try? GuestBridge.shared.shell("input keyevent KEYCODE_WAKEUP")
+                case .ready:             break
+                }
+
+                var pkg = Winlator.installedPackage()
+                if pkg == nil {
+                    let apk = try await Winlator.downloadAPK(progress: show)
+                    let remote = "/data/local/tmp/husk-winlator.apk"
+                    show("Copying Winlator to Android…")
+                    try GuestBridge.shared.push(apk, to: remote) { p in show("Copying Winlator to Android — \(Int(p * 100))%") }
+                    show("Installing Winlator…")
+                    let out = (try? GuestBridge.shared.shell("pm install -r \(remote); rm -f \(remote)", timeout: 900)) ?? ""
+                    HuskLog.log("windows", "install Winlator: \(out.trimmingCharacters(in: .whitespacesAndNewlines))")
+                    guard out.contains("Success") else {
+                        throw BridgeError.io("Android would not install Winlator: \(out.split(separator: "\n").last.map(String.init) ?? "no answer").")
+                    }
+                    Winlator.forgetAPK()
+                    pkg = Winlator.installedPackage() ?? Winlator.packages[0]
+                    await self?.refreshPackages()
+                }
+
+                _ = try? GuestBridge.shared.shell("mkdir -p \(AndroidHost.quote(Winlator.guestFolder))")
+                for file in files {
+                    // Stripped of quotes: the name reaches a shell, and whoever made the file chose it.
+                    let name = file.lastPathComponent.replacingOccurrences(of: "'", with: "")
+                    let remote = "\(Winlator.guestFolder)/\(name)"
+                    try GuestBridge.shared.push(file, to: AndroidHost.quote(remote)) { p in show("Sending \(name) — \(Int(p * 100))%") }
+                    _ = try? GuestBridge.shared.shell("am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d \(AndroidHost.quote("file://" + remote))", timeout: 60)
+                    try? FileManager.default.removeItem(at: file.deletingLastPathComponent())
+                    HuskLog.log("windows", "sent \(name) to \(Winlator.guestFolder)")
+                }
+
+                let launched = (try? GuestBridge.shared.shell("monkey -p \(pkg!) -c android.intent.category.LAUNCHER 1", timeout: 60)) ?? ""
+                HuskLog.log("windows", "launch \(pkg!): \(launched.split(separator: "\n").last ?? "")")
+                let names = files.map(\.lastPathComponent).joined(separator: ", ")
+                await MainActor.run {
+                    self?.busy = nil
+                    self?.say("Opened Winlator",
+                              "\(names) is in D:\Windows. In Winlator, start a container, open the file manager on D: and run it. "
+                            + "Windows programs run slowly here: small programs and old games work best.")
+                }
+            } catch {
+                HuskLog.log("windows", "could not open \(files.map(\.lastPathComponent)): \(error.localizedDescription)")
+                await MainActor.run {
+                    self?.busy = nil
+                    self?.say("Could not open the Windows program", error.localizedDescription, good: false)
+                }
+            }
+        }
+    }
+}
