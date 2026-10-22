@@ -710,7 +710,12 @@ final class QemuRunner: ObservableObject {
     /// user the app. Evaluated once and cached, because the answer is used both
     /// to size the guest and to build the command line, and they must agree.
     private lazy var ramFileReady: Bool = {
-        let needBytes = Int64(6144 + 768) * 1024 * 1024
+        // Room for the largest guest this device would be given, plus margin --
+        // not for 6 GiB, which no device is given any more. Asking for 6.9 GB
+        // free sent phones with a few gigabytes spare to anonymous memory, the
+        // smallest guest of all (1.5 GiB on an 8 GB iPhone).
+        let physMiB = Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024))
+        let needBytes = Int64(QemuRunner.fileBackedCapMiB(physicalMiB: physMiB) + 768) * 1024 * 1024
         let dir = (guestRamPath as NSString).deletingLastPathComponent
 
         if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: dir),

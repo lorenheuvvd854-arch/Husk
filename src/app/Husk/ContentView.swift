@@ -8,6 +8,9 @@ import UIKit
 /// lifecycle states. In particular `library` and `running` are the same VM --
 /// the difference is only whether its surface is on screen.
 struct ContentView: View {
+    /// When evaluate() last asked the release whether there is a newer guest.
+    private static var lastUpdateCheck = Date.distantPast
+
     @StateObject private var guest = GuestImage.shared
     @StateObject private var runner = QemuRunner.shared
     @StateObject private var bridge = HuskBridgeFS.shared
@@ -247,6 +250,13 @@ struct ContentView: View {
     }
 
     private func evaluate() {
+        // Nothing below can change while Android is running, and this runs far
+        // more often than "returning to the foreground" suggests: the log of one
+        // cold boot shows it every few seconds, each time re-validating the disk
+        // image and fetching the release manifest over the network -- I/O and
+        // CPU taken from the very boot it was interrupting.
+        if QemuRunner.shared.isRunning { return }
+
         // Before anything else wants JIT: the setting that turns it on as Husk opens.
         jit.enableAtLaunchIfAsked()
         try? guest.prepareFirmware()
@@ -257,7 +267,12 @@ struct ContentView: View {
         // What is installed is compared against the release by digest, not by
         // version name -- see GuestManifest. Deliberately not awaited: it is a
         // network round trip, and nothing on this screen should wait for it.
-        Task { await guest.checkForUpdates() }
+        // At most every half hour: a release does not change between two
+        // foreground passes a few seconds apart.
+        if Date().timeIntervalSince(Self.lastUpdateCheck) > 30 * 60 {
+            Self.lastUpdateCheck = Date()
+            Task { await guest.checkForUpdates() }
+        }
 
         if !JITBootstrap.ready {
             HuskLog.log("ui", "no JIT yet; waiting for a debugger")
