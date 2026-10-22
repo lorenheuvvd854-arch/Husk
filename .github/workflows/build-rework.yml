@@ -1,0 +1,150 @@
+# Builds the app on top of the published 3.0 release.
+#
+# A full build from source (scripts/ci_build.sh) compiles QEMU, ANGLE,
+# virglrenderer and MoltenVK and takes hours. Only the app's own code changes
+# here, so this compiles the app target alone, links it against the libraries
+# shipped in the official 3.0 IPA, and swaps the new executable into that IPA.
+# Everything else in the bundle -- QEMU, ANGLE, the Java runtime, the guest
+# kernel, the helper extensions -- is the release's own, byte for byte.
+name: Build rework IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [fix/emulation-stability-3.0]
+
+permissions:
+  contents: write
+
+env:
+  BASE_TAG: "3.0"
+  BASE_IPA: https://github.com/Leviidev/Husk/releases/download/3.0/Husk.ipa
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "using $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Fetch the official 3.0 IPA
+        run: |
+          curl -fsSL -o /tmp/official.ipa "$BASE_IPA"
+          mkdir -p /tmp/official
+          unzip -q /tmp/official.ipa -d /tmp/official
+          echo "OAPP=/tmp/official/Payload/Husk.app" >> "$GITHUB_ENV"
+          ls -la /tmp/official/Payload/Husk.app/Frameworks /tmp/official/Payload/Husk.app/PlugIns
+
+      - name: Stage prebuilt libraries from the release
+        run: |
+          set -euo pipefail
+          mkdir -p build/ios-arm64/lib build/ios-arm64/sysroot/lib
+          cp "$OAPP/Frameworks/libqemu-aarch64-softmmu.dylib" build/ios-arm64/lib/
+          cp "$OAPP/Frameworks/libANGLE-shared.dylib"         build/ios-arm64/sysroot/lib/
+          cp "$OAPP/Frameworks/libhuskps4.dylib"              build/ios-arm64/lib/
+          if [ -d "$OAPP/Frameworks/MoltenVK.framework" ]; then
+            xcodebuild -create-xcframework \
+              -framework "$OAPP/Frameworks/MoltenVK.framework" \
+              -output build/ios-arm64/lib/MoltenVK.xcframework
+          else
+            echo "no MoltenVK.framework in the IPA" >&2; exit 1
+          fi
+
+          # Inputs the pre-build script copies into the bundle. The bundle that
+          # ships is the release's, so these only have to exist.
+          mkdir -p guests/phase0 third_party/build/qemu-10.0.12-utm/pc-bios /tmp/fakebin
+          touch guests/phase0/vmlinuz-virt guests/phase0/initramfs-virt
+          echo placeholder | bzip2 > third_party/build/qemu-10.0.12-utm/pc-bios/edk2-aarch64-code.fd.bz2
+          printf '#!/bin/sh\n# qemu-img create -f qcow2 FILE SIZE\ntouch "$4"\n' > /tmp/fakebin/qemu-img
+          chmod +x /tmp/fakebin/qemu-img
+          echo "/tmp/fakebin" >> "$GITHUB_PATH"
+
+      - name: Build the on-device pairing library (Rust)
+        run: |
+          rustup target add aarch64-apple-ios
+          ./scripts/build_rppairing_ios.sh
+
+      - name: Generate the Xcode project
+        run: |
+          brew install xcodegen
+          cd src/app && xcodegen generate --quiet
+
+      - name: Build the app
+        run: |
+          set -o pipefail
+          xcodebuild -project src/app/Husk.xcodeproj -scheme Husk \
+            -sdk iphoneos -configuration Release -derivedDataPath /tmp/dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > /tmp/build.log 2>&1 || {
+              echo "::group::errors"; grep -E "error:" /tmp/build.log | sort -u | head -80; echo "::endgroup::"
+              tail -60 /tmp/build.log
+              exit 1
+            }
+          grep -q "BUILD SUCCEEDED" /tmp/build.log
+          ls -la /tmp/dd/Build/Products/Release-iphoneos/Husk.app/Husk
+
+      - name: Package IPA and TIPA
+        run: |
+          set -euo pipefail
+          NEW_EXE=/tmp/dd/Build/Products/Release-iphoneos/Husk.app/Husk
+          SHORT=$(git rev-parse --short HEAD)
+          mkdir -p out
+
+          package() {   # $1 = output file, $2 = trollstore (true/false)
+            local STAGE; STAGE=$(mktemp -d)
+            mkdir -p "$STAGE/Payload"
+            cp -R "$OAPP" "$STAGE/Payload/"
+            local SAPP="$STAGE/Payload/Husk.app"
+            cp "$NEW_EXE" "$SAPP/Husk"
+            plutil -replace HuskBuildCommit -string "rework-$SHORT" "$SAPP/Info.plist"
+            plutil -replace HuskBuildDate -string "$(date -u '+%Y-%m-%d %H:%M UTC')" "$SAPP/Info.plist"
+
+            local ENT="$STAGE/entitlements.plist"
+            cp src/app/Husk/Husk.entitlements "$ENT"
+            if [ "$2" = true ]; then
+              for key in com.apple.private.cs.debugger dynamic-codesigning \
+                         com.apple.private.skip-library-validation; do
+                plutil -remove "$key" "$ENT" 2>/dev/null || true
+              done
+            fi
+            sign() { codesign --force --sign - --timestamp=none "$@"; }
+            find "$SAPP" -name "*.dylib" -not -path "*/Frameworks/*.framework/*" | while read -r f; do sign "$f"; done
+            for fw in "$SAPP"/Frameworks/*.framework; do [ -d "$fw" ] && sign "$fw"; done
+            for ex in "$SAPP"/PlugIns/*.appex; do [ -d "$ex" ] && sign "$ex"; done
+            sign --entitlements "$ENT" "$SAPP"
+            codesign -d --entitlements - "$SAPP" 2>&1 | grep -qE "increased-memory|extended-virtual"
+            ( cd "$STAGE" && zip -qry "$GITHUB_WORKSPACE/$1" Payload )
+            rm -rf "$STAGE"
+          }
+          package out/Husk-rework.ipa false
+          package out/Husk-rework.tipa true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Husk-rework
+          path: out/*
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: /tmp/build.log
+          if-no-files-found: ignore
+
+      - name: Publish as a release in this repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="rework-$(git rev-parse --short HEAD)"
+          gh release create "$TAG" out/Husk-rework.ipa out/Husk-rework.tipa \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Husk 3.0 rework ($TAG)" \
+            --notes "Husk 3.0 with the emulation stability fixes. Install Husk-rework.ipa with SideStore/AltStore, or Husk-rework.tipa with TrollStore."
