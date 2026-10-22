@@ -943,14 +943,31 @@ final class QemuRunner: ObservableObject {
             try? FileManager.default.removeItem(atPath: snapshotSizePath)
         }
 
+        let physMiB = Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024))
+        let fileCapMiB = QemuRunner.fileBackedCapMiB(physicalMiB: physMiB)
+
         if !strategyChanged,
            let recorded = try? String(contentsOfFile: snapshotSizePath, encoding: .utf8),
            let mib = Int(recorded.trimmingCharacters(in: .whitespacesAndNewlines)), mib > 0 {
-            HuskLog.log("qemu", "snapshot exists; using its guest size of \(mib) MiB")
-            return mib
+            if mib <= fileCapMiB {
+                // Recorded here as on every other path. Without it lastGuestMiB
+                // stayed 0, so run() decided the snapshot did not fit and
+                // cold-booted every launch, the balloon (which skips a zero
+                // size) never engaged, and the next save stamped "0" as the
+                // guest size.
+                QemuRunner.shared.lastGuestMiB = mib
+                HuskLog.log("qemu", "snapshot exists; using its guest size of \(mib) MiB")
+                return mib
+            }
+            // A machine saved by an earlier build at a size this phone can only
+            // provide by paging guest RAM to flash. Keeping it keeps the lag, so
+            // it costs one cold boot instead.
+            HuskLog.log("qemu", "snapshot was saved with a \(mib) MiB guest, above the "
+                              + "\(fileCapMiB) MiB this device can keep resident; "
+                              + "retiring it, so this boot is a cold one")
+            try? FileManager.default.removeItem(atPath: snapshotSizePath)
         }
 
-        let physMiB = Int(ProcessInfo.processInfo.physicalMemory / (1024 * 1024))
         let availableMiB = Int(husk_ios_available_memory() / (1024 * 1024))
 
         // os_proc_available_memory() is the real ceiling, not a floor. Budgeting
@@ -1029,6 +1046,13 @@ final class QemuRunner: ObservableObject {
             HuskLog.log("qemu", "\(failed) MiB is known to fail on this device; "
                               + "staying below it")
         }
+        // Mappable is not the same as affordable. A file-backed block can be far
+        // larger than what fits in RAM, and the excess is then paged to and from
+        // flash on the vCPU threads -- every guest access to an evicted page is
+        // a synchronous disk read. Android, seeing gigabytes free, never trims
+        // its caches, so the longer a session ran the more of it was paging.
+        // That is the steady lag that set in a few minutes into every session.
+        candidates = candidates.filter { $0 <= fileCapMiB }
         let fileBackedTarget = ramFileReady ? largestMappableMiB(candidates) : nil
         let target = fileBackedTarget.map { max(anonymousTarget, $0) } ?? anonymousTarget
 
@@ -1044,6 +1068,15 @@ final class QemuRunner: ObservableObject {
                              + "have given it \(anonymousTarget) MiB)"
                              : "as anonymous memory"))
         return target
+    }
+
+    /// The largest file-backed guest worth giving this phone.
+    ///
+    /// About a third of physical memory: enough for Android to run comfortably,
+    /// small enough that the page cache can keep all of it resident next to
+    /// everything else iOS is doing, so nothing is paged to flash.
+    nonisolated static func fileBackedCapMiB(physicalMiB: Int) -> Int {
+        min(4096, max(2048, physicalMiB * 35 / 100))
     }
 
     /// Phase 1 guest: LineageOS booting directly under QEMU via UEFI.
@@ -1552,7 +1585,10 @@ final class QemuRunner: ObservableObject {
             var quietWindows = 0
             var lastAudioFrames: UInt64 = 0
             var lastAudioSilent: UInt64 = 0
-            while true {
+            // Each tick in its own pool. This thread never returns, so without
+            // one every bridged string and dictionary it touches is kept for the
+            // life of the process.
+            while true { autoreleasepool {
                 Thread.sleep(forTimeInterval: 5)
                 tick += 1
                 HuskLog.logFootprint("t+\(tick * 5)s")
@@ -1696,7 +1732,7 @@ final class QemuRunner: ObservableObject {
                                       + "(if this grows but no [guest] lines appear, "
                                       + "the tailer is at fault, not the guest)")
                 }
-            }
+            } }
         }
         t.name = "husk.memwatch"
         t.qualityOfService = .utility
@@ -1721,30 +1757,31 @@ final class QemuRunner: ObservableObject {
             var buf = [UInt8](repeating: 0, count: 64 * 1024)
             var totalRead = 0
             var reportedOpen = false
+            var denials = 0
 
-            while true {
+            while true { autoreleasepool {
                 if fd < 0 {
                     fd = open(path, O_RDONLY)
                     if fd >= 0, !reportedOpen {
                         reportedOpen = true
                         HuskLog.log("guest", "serial log opened (fd \(fd))")
                     }
-                    if fd < 0 { Thread.sleep(forTimeInterval: 0.5); continue }
+                    if fd < 0 { Thread.sleep(forTimeInterval: 0.5); return }
                 }
 
                 let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, 64 * 1024) }
                 if n < 0 {
-                    if errno == EINTR { continue }
+                    if errno == EINTR { return }
                     HuskLog.log("guest", "serial read failed: errno \(errno); reopening")
                     close(fd); fd = -1
                     Thread.sleep(forTimeInterval: 1)
-                    continue
+                    return
                 }
                 if n == 0 {
                     // EOF for now; the fd keeps its offset, so appended bytes are
                     // picked up on the next read.
                     Thread.sleep(forTimeInterval: 0.25)
-                    continue
+                    return
                 }
 
                 totalRead += n
@@ -1760,7 +1797,18 @@ final class QemuRunner: ObservableObject {
                     line = line.trimmingCharacters(in: .whitespaces)
                     if line.isEmpty { continue }
 
-                    HuskLog.log("guest", line)
+                    // SELinux denials are most of what a booted Android prints,
+                    // and each one mirrored here is an os_log call and a write
+                    // to husk.log. The first few say what is being denied; the
+                    // rest stay in guest-serial.log for anyone who needs them.
+                    let isDenial = line.contains("avc:") || line.contains("audit:")
+                    if isDenial { denials += 1 }
+                    if !isDenial || denials <= 200 {
+                        HuskLog.log("guest", line)
+                    } else if denials % 1000 == 0 {
+                        HuskLog.log("guest", "(\(denials) SELinux denials so far; "
+                                           + "only the first 200 are mirrored here)")
+                    }
 
                     // Say what the guest is doing, so a long first boot does
                     // not look like a hang.
@@ -1773,8 +1821,9 @@ final class QemuRunner: ObservableObject {
                     // and gets force-quit a minute short of finishing. It only
                     // has to succeed once, because the snapshot is taken after
                     // it, but it does have to succeed once.
+                    let tracking = !QemuRunner.didRestore && QemuRunner.bootCompletedAt == nil
                     for (needle, milestone, percent) in
-                            (QemuRunner.didRestore ? [] : QemuRunner.bootMilestones) {
+                            (tracking ? QemuRunner.bootMilestones : []) {
                         if line.contains(needle) {
                             let secs = Int(Date().timeIntervalSince(QemuRunner.bootStarted))
                             let mins = secs / 60, rem = secs % 60
@@ -1813,7 +1862,7 @@ final class QemuRunner: ObservableObject {
                     HuskLog.log("guest", "serial buffer exceeded 1 MB with no newline; discarding")
                     pending.removeAll(keepingCapacity: true)
                 }
-            }
+            } }
         }
         t.name = "husk.serial-tail"
         t.qualityOfService = .utility

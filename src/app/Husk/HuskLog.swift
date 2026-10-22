@@ -164,18 +164,19 @@ enum HuskLog {
         let t = Thread {
             var pending = Data()
             var buf = [UInt8](repeating: 0, count: 16 * 1024)
-            while true {
+            var done = false
+            while !done { autoreleasepool {
                 let n = read(pipeReadFD, &buf, buf.count)
                 if n < 0 {
-                    if errno == EINTR { continue }
-                    break
+                    if errno != EINTR { done = true }
+                    return
                 }
                 // End of file, not end of stream: the writer is still open and
                 // more will arrive. A pipe blocked here; a file returns 0, so
                 // this is where the tail waits.
                 if n == 0 {
                     usleep(40_000)
-                    continue
+                    return
                 }
                 pending.append(contentsOf: buf[0..<n])
 
@@ -188,7 +189,7 @@ enum HuskLog {
                         emit(line, fromStream: true)
                     }
                 }
-            }
+            } }
         }
         t.name = "com.husk.log.reader"
         t.qualityOfService = .userInitiated
@@ -281,7 +282,9 @@ enum HuskLog {
     private static func emit(_ line: String, fromStream: Bool) {
         ringLock.lock()
         ring.append(line)
-        if ring.count > ringLimit { ring.removeFirst(ring.count - ringLimit) }
+        // Trimmed in batches. Dropping one line at a time shifted all four
+        // thousand of them on every log line once the ring was full.
+        if ring.count > ringLimit + 500 { ring.removeFirst(ring.count - ringLimit) }
         ringLock.unlock()
 
         // The C side (husk-ios-jit.c, husk-display.c) writes to os_log itself as

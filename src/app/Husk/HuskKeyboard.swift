@@ -45,14 +45,14 @@ final class KeyCapturingView: UIView, UIKeyInput {
             HuskLog.log("kbd", "no key for character \(String(reflecting: ch))")
             return
         }
-        if needsShift { _ = husk_display_send_key("shift", true) }
+        if needsShift { GuestInput.key("shift", true) }
         tap(qcode)
-        if needsShift { _ = husk_display_send_key("shift", false) }
+        if needsShift { GuestInput.key("shift", false) }
     }
 
     private func tap(_ qcode: String) {
-        _ = husk_display_send_key(qcode, true)
-        _ = husk_display_send_key(qcode, false)
+        GuestInput.key(qcode, true)
+        GuestInput.key(qcode, false)
     }
 
     // MARK: - Hardware keyboard
@@ -61,7 +61,7 @@ final class KeyCapturingView: UIView, UIKeyInput {
         var handled = false
         for press in presses {
             if let key = press.key, let qcode = Self.hidMap[key.keyCode] {
-                _ = husk_display_send_key(qcode, true)
+                GuestInput.key(qcode, true)
                 handled = true
             }
         }
@@ -72,7 +72,7 @@ final class KeyCapturingView: UIView, UIKeyInput {
         var handled = false
         for press in presses {
             if let key = press.key, let qcode = Self.hidMap[key.keyCode] {
-                _ = husk_display_send_key(qcode, false)
+                GuestInput.key(qcode, false)
                 handled = true
             }
         }
@@ -84,7 +84,7 @@ final class KeyCapturingView: UIView, UIKeyInput {
         // stuck down.
         for press in presses {
             if let key = press.key, let qcode = Self.hidMap[key.keyCode] {
-                _ = husk_display_send_key(qcode, false)
+                GuestInput.key(qcode, false)
             }
         }
     }
@@ -224,7 +224,7 @@ struct SpecialKeysBar: View {
             // touchscreen, so tap Ctrl, then tap the letter.
             Button {
                 ctrlLatched.toggle()
-                _ = husk_display_send_key("ctrl", ctrlLatched)
+                GuestInput.key("ctrl", ctrlLatched)
                 HuskLog.log("kbd", "ctrl \(ctrlLatched ? "held" : "released")")
             } label: {
                 Text("ctrl")
@@ -237,11 +237,11 @@ struct SpecialKeysBar: View {
 
             ForEach(keys, id: \.1) { label, qcode in
                 Button {
-                    _ = husk_display_send_key(qcode, true)
-                    _ = husk_display_send_key(qcode, false)
+                    GuestInput.key(qcode, true)
+                    GuestInput.key(qcode, false)
                     if ctrlLatched {
                         ctrlLatched = false
-                        _ = husk_display_send_key("ctrl", false)
+                        GuestInput.key("ctrl", false)
                     }
                 } label: {
                     Text(label)

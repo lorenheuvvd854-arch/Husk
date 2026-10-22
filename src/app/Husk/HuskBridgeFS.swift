@@ -433,6 +433,12 @@ final class GuestBridge {
         defer { controlLock.unlock() }
         do {
             return try exchange(command, timeout: timeout)
+        } catch BridgeError.timeout(let what) {
+            // No retry on a timeout. The connection is kept on a timeout, so a
+            // retry is the same wait again on the same silent guest -- which
+            // doubled every stall, and held controlLock (and with it every
+            // other caller, the UI's included) for twice as long.
+            throw BridgeError.timeout(what)
         } catch {
             // One retry, and only because the held connection may simply have
             // aged out while nothing was using it. dropControl() already cleared
@@ -657,7 +663,7 @@ final class GuestBridge {
             var ticks = 0
             var lastCrashLine: String?
             var lastAudioLog: [String] = []
-            while let self {
+            while let self { autoreleasepool {
                 let alive = (try? self.shell("echo __HUSK_ALIVE__", timeout: 30))?
                     .contains("__HUSK_ALIVE__") ?? false
                 // Sample the guest's own routing while we still can.
@@ -669,7 +675,13 @@ final class GuestBridge {
                 // stays open. That is exactly what these two commands show, and
                 // both run fine as shell. The last sample before the silence is
                 // the one that matters.
-                if alive, ticks % 3 == 0, ticks < 30 {
+                // Off unless asked for. Each of these spawns processes inside a
+                // guest whose CPU is emulated -- logcat in particular reads and
+                // filters the whole log buffer -- and they ran every fifteen to
+                // thirty seconds for the life of the session, which is a
+                // periodic stutter in everything Android is doing.
+                let verbose = GuestBridge.verboseDiagnostics
+                if verbose, alive, ticks % 3 == 0, ticks < 30 {
                     for cmd in ["ip addr show", "ip rule show", "ip route show table all"] {
                         if let out = try? self.shell(cmd, timeout: 20) {
                             HuskLog.log("net", "[t+\(ticks * 5)s] \(cmd):\n"
@@ -688,7 +700,7 @@ final class GuestBridge {
                 //
                 // `-b crash` is a small dedicated ring, so this is cheap: a few
                 // lines every half minute, and only the ones not seen before.
-                if alive, ticks % 6 == 0, ticks > 0 {
+                if verbose, alive, ticks % 6 == 0, ticks > 0 {
                     // Android's audio stack, at warning level and above. One
                     // sound effect played and then silence, with the guest
                     // queueing three buffers in three minutes -- whatever made
@@ -712,7 +724,9 @@ final class GuestBridge {
                         }
                     }
                 }
-                if alive, ticks % 6 == 3 {
+                // The crash buffer is worth reading without the verbose switch,
+                // but every two minutes rather than every thirty seconds.
+                if alive, ticks % (verbose ? 6 : 24) == 3 {
                     if let out = try? self.shell("logcat -b crash -d -t 200", timeout: 30) {
                         let lines = out.split(separator: "\n").map(String.init)
                             .filter { !$0.isEmpty && !$0.hasPrefix("---------") }
@@ -751,10 +765,16 @@ final class GuestBridge {
                 // regular traffic is both the cheapest test of that theory and
                 // its cure. It is one `echo` on a connection we already hold.
                 Thread.sleep(forTimeInterval: 5)
-            }
+            } }
         }
     }
     private var watching = false
+
+    /// Whether the health watch also samples routing, audio and logcat.
+    /// Diagnostics for chasing a specific bug, not something to pay for always.
+    static var verboseDiagnostics: Bool {
+        UserDefaults.standard.bool(forKey: "husk.verboseGuestDiagnostics")
+    }
 
     func disconnect() { isConnected = false }
 }
@@ -1798,7 +1818,13 @@ final class AndroidHost: ObservableObject {
     /// Done from the bridge rather than the guest image because the bridge is
     /// already a shell and `settings` is a shell command -- the same call from
     /// init fails, which is why husk-provision.rc has never worked.
-    func quietAbsentHardware() async {
+    ///
+    /// nonisolated, and that is the fix for a hang: AndroidHost is @MainActor,
+    /// so as a plain async method this ran ON the main thread, and run() is a
+    /// blocking socket round trip with a sixty-second timeout (twice, with the
+    /// retry). Right after every boot the UI froze for as long as the guest
+    /// took to answer, long enough for iOS to kill the app as hung.
+    nonisolated func quietAbsentHardware() async {
         let off = [
             ("bluetooth", "settings put global bluetooth_on 0"),
             ("ble scan",  "settings put global ble_scan_always_enabled 0"),
@@ -1823,7 +1849,10 @@ final class AndroidHost: ObservableObject {
     ///
     /// Line by line rather than one blob: the log is read by grepping for
     /// markers, and a single entry holding a hundred newlines defeats that.
-    func dumpCrashes() async {
+    ///
+    /// nonisolated for the same reason as quietAbsentHardware(): a blocking
+    /// two-minute shell call has no business on the main actor.
+    nonisolated func dumpCrashes() async {
         let out = (try? GuestBridge.shared.shell("logcat -d -b crash -t 200 2>/dev/null",
                                                  timeout: 120)) ?? ""
         let lines = out.split(separator: "\n").map(String.init)

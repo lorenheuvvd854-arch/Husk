@@ -230,16 +230,16 @@ final class HuskGLView: UIView {
         return (Int32(gx), Int32(gy))
     }
 
-    private func send(_ touch: UITouch, down: Bool) {
+    private func send(_ touch: UITouch, down: Bool, moved: Bool = false) {
         guard let (x, y) = guestPoint(from: touch.location(in: self)) else { return }
-        husk_display_send_pointer(x, y, down)
+        GuestInput.pointer(x, y, down: down, moved: moved)
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if let t = touches.first { send(t, down: true) }
     }
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if let t = touches.first { send(t, down: true) }
+        if let t = touches.first { send(t, down: true, moved: true) }
     }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if let t = touches.first { send(t, down: false) }
@@ -253,4 +253,67 @@ struct HuskGLScreen: UIViewRepresentable {
     // The shared instance, never a fresh one -- see HuskGLView.shared.
     func makeUIView(context: Context) -> HuskGLView { HuskGLView.shared }
     func updateUIView(_ view: HuskGLView, context: Context) {}
+}
+
+/// Touches and keys for the guest, delivered off the main thread.
+///
+/// qemu_input_* needs the BQL, and taking it on the UI thread meant every touch
+/// waited for whatever QEMU's main loop was holding it for -- a frame being
+/// presented, a disk flush, or for the whole fifteen seconds of a snapshot
+/// save. A finger on the screen during any of those froze the interface, and a
+/// long enough freeze is one iOS kills the app for. Touches arriving before
+/// qemu_init() had returned were worse: bql_lock() on a mutex that did not
+/// exist yet aborts the process outright.
+///
+/// One serial queue keeps events in order. Moves are coalesced, so a stalled
+/// guest catches up with where the finger is now rather than replaying every
+/// point it passed through.
+enum GuestInput {
+    private static let queue = DispatchQueue(label: "com.husk.input", qos: .userInteractive)
+    private static let lock = NSLock()
+    private static var pendingMove: (x: Int32, y: Int32)?
+    private static var moveScheduled = false
+    /// Bumped by every press and release, so a move scheduled before one can
+    /// never be delivered after it.
+    private static var generation: UInt64 = 0
+
+    static func pointer(_ x: Int32, _ y: Int32, down: Bool, moved: Bool = false) {
+        lock.lock()
+        if moved {
+            pendingMove = (x, y)
+            guard !moveScheduled else { lock.unlock(); return }
+            moveScheduled = true
+            let gen = generation
+            lock.unlock()
+            queue.async {
+                GuestInput.lock.lock()
+                guard gen == GuestInput.generation else { GuestInput.lock.unlock(); return }
+                let move = GuestInput.pendingMove
+                GuestInput.pendingMove = nil
+                GuestInput.moveScheduled = false
+                GuestInput.lock.unlock()
+                guard let move, QemuRunner.qemuReady else { return }
+                husk_display_send_pointer(move.x, move.y, true)
+            }
+            return
+        }
+        // The last position of the finger goes first, then the press or release.
+        let flushed = pendingMove
+        pendingMove = nil
+        moveScheduled = false
+        generation &+= 1
+        lock.unlock()
+        queue.async {
+            guard QemuRunner.qemuReady else { return }
+            if let flushed { husk_display_send_pointer(flushed.x, flushed.y, true) }
+            husk_display_send_pointer(x, y, down)
+        }
+    }
+
+    static func key(_ qcode: String, _ down: Bool) {
+        queue.async {
+            guard QemuRunner.qemuReady else { return }
+            _ = husk_display_send_key(qcode, down)
+        }
+    }
 }

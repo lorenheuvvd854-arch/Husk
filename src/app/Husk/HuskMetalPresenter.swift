@@ -35,6 +35,22 @@ final class HuskMetalPresenter {
     private var complained = false
     private var presented: UInt64 = 0
 
+    /// The newest frame QEMU has handed over and nobody has drawn yet.
+    ///
+    /// QEMU calls in from its main loop with the BQL held, and drawing there
+    /// meant waiting in nextDrawable() -- up to a second whenever Core Animation
+    /// still had every drawable in flight, or the layer was off screen. For
+    /// that whole wait no vCPU could finish an MMIO access or take an
+    /// interrupt, so Android stalled in step with the display, and the main
+    /// thread blocked too the moment it touched the same lock to rotate.
+    /// Now QEMU only leaves the texture here; a thread of its own draws it,
+    /// and frames that arrive faster than the screen can show them collapse
+    /// into the latest one.
+    private var pendingTexture: MTLTexture?
+    private var pendingFlip = false
+    private let frameReady = DispatchSemaphore(value: 0)
+    private var renderThread: Thread?
+
     /// Whether the guest's picture needs a quarter turn to match the screen.
     /// Set by HuskGLView when the device orientation changes, and read on
     /// QEMU's thread, so it goes through the same lock as everything else.
@@ -137,17 +153,56 @@ final class HuskMetalPresenter {
         return sampler != nil
     }
 
-    /// Called from QEMU's thread, once per guest frame.
+    /// Called from QEMU's thread, once per guest frame. Never blocks.
     func present(texture: MTLTexture, flip: Bool) {
         lock.lock()
-        defer { lock.unlock() }
+        let wasIdle = pendingTexture == nil
+        pendingTexture = texture
+        pendingFlip = flip
+        if renderThread == nil {
+            let t = Thread { [unowned self] in self.renderLoop() }
+            t.name = "husk.present"
+            t.qualityOfService = .userInteractive
+            renderThread = t
+            t.start()
+        }
+        lock.unlock()
+        // One signal per idle -> pending transition, so the render thread never
+        // spins and never misses a frame it has not already taken.
+        if wasIdle { frameReady.signal() }
+    }
+
+    private func renderLoop() {
+        while true {
+            frameReady.wait()
+            // The thread never returns, so nothing autoreleased in a frame --
+            // drawables, command buffers, pass descriptors -- would ever be
+            // freed without a pool of its own around each one.
+            autoreleasepool {
+                lock.lock()
+                let texture = pendingTexture
+                let flip = pendingFlip
+                pendingTexture = nil
+                lock.unlock()
+                if let texture { draw(texture: texture, flip: flip) }
+            }
+        }
+    }
+
+    /// Render thread only: device, queue and pipeline are touched nowhere else.
+    private func draw(texture: MTLTexture, flip: Bool) {
+        lock.lock()
+        let layer = self.layer
+        let rotated = self.rotated
+        lock.unlock()
 
         guard let layer else { return }
         guard prepare(for: texture, layer),
               let queue, let pipeline, let sampler else { return }
 
         // nextDrawable returns nil when the pool is exhausted -- a dropped
-        // frame, not an error, and the guest will send another.
+        // frame, not an error, and the guest will send another. It may also
+        // wait, which is why this is not QEMU's thread.
         guard let drawable = layer.nextDrawable() else { return }
 
         let pass = MTLRenderPassDescriptor()

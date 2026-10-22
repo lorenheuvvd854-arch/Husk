@@ -142,7 +142,12 @@ struct DiscoverView: View {
             if isInstalled {
                 Button("Open") {
                     let intent = "am start -n \(app.bundleIdentifier)/\(app.bundleIdentifier).MainActivity"
-                    _ = try? GuestBridge.shared.shell(intent, timeout: 5)
+                    // Off the main thread: the bridge serialises every command
+                    // on one connection, so behind an install this call waited
+                    // minutes for its turn, with the UI frozen until iOS killed it.
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        _ = try? GuestBridge.shared.shell(intent, timeout: 5)
+                    }
                 }
                 .buttonStyle(.bordered)
                 .buttonBorderShape(.capsule)

@@ -15,6 +15,9 @@ final class HuskMetalView: MTKView {
     private var texture: MTLTexture?
     private var textureGeneration: UInt64 = .max
     private var lastSequence: UInt64 = .max
+    /// What is already on screen, so an unchanged frame is not drawn again.
+    private var presentedSequence: UInt64 = .max
+    private var presentedSize: CGSize = .zero
 
     /// Guest surface size, for mapping touches back into guest coordinates.
     private var guestWidth: Int32 = 0
@@ -75,16 +78,16 @@ final class HuskMetalView: MTKView {
         return (Int32(gx), Int32(gy))
     }
 
-    private func send(_ touch: UITouch, down: Bool) {
+    private func send(_ touch: UITouch, down: Bool, moved: Bool = false) {
         guard let (x, y) = guestPoint(from: touch.location(in: self)) else { return }
-        husk_display_send_pointer(x, y, down)
+        GuestInput.pointer(x, y, down: down, moved: moved)
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         if let t = touches.first { send(t, down: true) }
     }
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if let t = touches.first { send(t, down: true) }
+        if let t = touches.first { send(t, down: true, moved: true) }
     }
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         if let t = touches.first { send(t, down: false) }
@@ -98,12 +101,18 @@ extension HuskMetalView: MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
-        guard let device,
-              let commandQueue,
-              let drawable = currentDrawable,
-              let pass = currentRenderPassDescriptor else { return }
+        guard let device, let commandQueue else { return }
 
         let seq = husk_display_sequence()
+
+        // Nothing new from the guest and nothing about the view changed: the
+        // layer still shows the last frame, so leave it. Asking for a drawable
+        // anyway cost a lock round trip with QEMU and a full-screen pass sixty
+        // times a second on the main thread -- and currentDrawable can block
+        // for up to a second when the pool is empty.
+        if seq == presentedSequence, texture != nil, drawableSize == presentedSize {
+            return
+        }
 
         // No need to poke QEMU for a redraw here: register_displaychangelistener()
         // calls gui_setup_refresh(), which drives dpy_refresh on QEMU's own timer
@@ -139,6 +148,8 @@ extension HuskMetalView: MTKViewDelegate {
         husk_display_unlock_frame()
 
         guard let texture,
+              let drawable = currentDrawable,
+              let pass = currentRenderPassDescriptor,
               let pipeline = pipelineState,
               let buffer = commandQueue.makeCommandBuffer(),
               let enc = buffer.makeRenderCommandEncoder(descriptor: pass) else { return }
@@ -157,6 +168,8 @@ extension HuskMetalView: MTKViewDelegate {
         enc.endEncoding()
         buffer.present(drawable)
         buffer.commit()
+        presentedSequence = lastSequence
+        presentedSize = drawableSize
     }
 }
 
