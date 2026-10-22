@@ -129,7 +129,7 @@ enum FAQ {
                        + "Windows programs (.exe, .msi) work too: see the next question."),
             Item(question: "Can I run Windows programs (.exe)?",
                  answer: "Yes, inside Android. Open the .exe in Husk and it goes to Android's Download/Windows folder, Husk installs Winlator "
-                       + "(Wine with Box64) the first time and opens it. In Winlator, start a container, open D:\Windows and run the program. "
+                       + "(Wine with Box64) the first time and opens it. In Winlator, start a container, open D:\\Windows and run the program. "
                        + "Everything is emulated twice, so it is slow: small programs and old games work, recent games do not."),
             Item(question: "A game runs slowly or the phone gets hot",
                  answer: "Close other apps and let the phone cool. Games run natively, but some do work on the CPU that a real Android phone does on hardware. "

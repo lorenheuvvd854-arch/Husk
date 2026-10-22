@@ -1992,7 +1992,7 @@ extension AndroidHost {
                 await MainActor.run {
                     self?.busy = nil
                     self?.say("Opened Winlator",
-                              "\(names) is in D:\Windows. In Winlator, start a container, open the file manager on D: and run it. "
+                              "\(names) is in D:\\Windows. In Winlator, start a container, open the file manager on D: and run it. "
                             + "Windows programs run slowly here: small programs and old games work best.")
                 }
             } catch {
