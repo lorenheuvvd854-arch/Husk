@@ -8,7 +8,10 @@ import Foundation
 /// Written for Husk from how those requests look on the wire; it shares no code with any other client.
 struct PlayError: LocalizedError {
     let message: String
-    init(_ message: String) { self.message = message }
+    /// The bearer token is no longer accepted (401), or a shared guest token is being refused for overuse (429). Either way a
+    /// fresh token is the cure, and the caller can get one and try again.
+    var needsNewToken = false
+    init(_ message: String, needsNewToken: Bool = false) { self.message = message; self.needsNewToken = needsNewToken }
     var errorDescription: String? { message }
 }
 
@@ -277,7 +280,8 @@ enum PlayAPI {
         let (data, response) = try await urlSession.data(for: req)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         let wrapper = ProtoMessage(data)
-        if status == 401 { throw PlayError("Google Play's session has ended; signing in again.") }
+        if status == 401 { throw PlayError("Google Play's session has ended; signing in again.", needsNewToken: true) }
+        if status == 429 { throw PlayError("Google Play is limiting requests from this account; try again shortly.", needsNewToken: true) }
         guard status == 200 else {
             let message = wrapper.message(5)?.string(1) ?? "HTTP \(status)"    // ServerCommands.displayErrorMessage
             throw PlayError("Google Play said no: \(message)")
@@ -467,10 +471,12 @@ enum PlayAPI {
         // Helper to extract valid Android package names from any string / HTML
         func extractPackageNames(from text: String) -> [String] {
             var found: [String] = []
+            // Only links to an app's page. Matching any dotted word as well filled the candidates with "www.gstatic.com",
+            // "window.location" and the like, each of which then cost a details call that could only fail -- up to twenty
+            // wasted requests a search, enough for Google to start refusing the real ones.
             let patterns = [
                 "/store/apps/details\\?id=([a-zA-Z][a-zA-Z0-9_]*(?:\\.[a-zA-Z][a-zA-Z0-9_]+)+)",
-                "id=([a-zA-Z][a-zA-Z0-9_]*(?:\\.[a-zA-Z][a-zA-Z0-9_]+)+)",
-                "\\b([a-zA-Z][a-zA-Z0-9_]*(?:\\.[a-zA-Z][a-zA-Z0-9_]+)+)\\b"
+                "[?&]id=([a-zA-Z][a-zA-Z0-9_]*(?:\\.[a-zA-Z][a-zA-Z0-9_]+)+)"
             ]
             for pattern in patterns {
                 guard let regex = try? NSRegularExpression(pattern: pattern) else { continue }
@@ -496,12 +502,25 @@ enum PlayAPI {
         }
 
         // 2. Direct fdfe/search call with ksm=1
+        //
+        // Not `try?` for this one. An expired token answers every call with 401, and swallowing that here (as the steps below
+        // still do) turned "sign in again" into an empty result list with nothing said -- search worked for the first hour after
+        // launch, until the bearer token ran out, and then never again.
         let q = [
             ("c", "3"),
             ("q", trimmed),
             ("ksm", "1")
         ]
-        if let payload = try? await fdfeCall("search", session: session, query: q) {
+        let searchPayload: ProtoMessage?
+        do {
+            searchPayload = try await fdfeCall("search", session: session, query: q)
+        } catch let e as PlayError where e.needsNewToken {
+            throw e
+        } catch {
+            searchPayload = nil
+        }
+        try Task.checkCancellation()
+        if let payload = searchPayload {
             let immediateApps = PlayApp.parseApps(from: payload)
             for app in immediateApps {
                 if !candidatePackages.contains(app.id) {
@@ -530,6 +549,8 @@ enum PlayAPI {
             }
         }
 
+        try Task.checkCancellation()
+
         // 3. fdfe/searchSuggest call
         if candidatePackages.count < 10 {
             let suggestQuery = [
@@ -546,6 +567,8 @@ enum PlayAPI {
                 }
             }
         }
+
+        try Task.checkCancellation()
 
         // 4. Web search fallback: query Google Play's public search catalog to obtain top ranked package IDs
         if candidatePackages.count < 10 {
@@ -585,6 +608,9 @@ enum PlayAPI {
         if candidatePackages.isEmpty {
             return []
         }
+
+        // A search that has been typed over is not worth twenty more requests.
+        try Task.checkCancellation()
 
         // Limit candidate list to top 20 to avoid excessive queries
         let topCandidates = Array(candidatePackages.prefix(20))

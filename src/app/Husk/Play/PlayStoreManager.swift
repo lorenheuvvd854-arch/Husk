@@ -153,12 +153,44 @@ final class PlayStoreManager: ObservableObject {
 
     // MARK: - Store Browsing & Searching
 
+    /// Run a store call, and when Google says the token is spent (401, or 429 for a shared guest token) get a new one and run it
+    /// once more. Tokens were only refreshed at launch, so a Store left open for an hour stopped answering for good.
+    private func withFreshToken<T>(_ call: (PlaySession) async throws -> T) async throws -> T {
+        guard let s = session, !s.bearer.isEmpty else { throw PlayError("Not signed in to Google Play.") }
+        do {
+            return try await call(s)
+        } catch let e as PlayError where e.needsNewToken {
+            HuskLog.log("store", "token refused (\(e.message)); getting a new one and trying again")
+            await renewToken()
+            guard let fresh = session, !fresh.bearer.isEmpty else { throw e }
+            return try await call(fresh)
+        }
+    }
+
+    /// A new bearer token for the session as it is, without reloading anything.
+    private func renewToken() async {
+        guard var s = session else { return }
+        do {
+            if s.isAnonymous {
+                saveSession(try await PlayAPI.fetchAuroraGuestSession())
+            } else if !s.aasToken.isEmpty {
+                s.bearer = try await PlayAPI.playToken(s)
+                saveSession(s)
+            }
+        } catch {
+            HuskLog.log("store", "could not renew the Play token: \(error.localizedDescription)")
+        }
+    }
+
+    /// Bumped by every search, so only the newest one may touch the results.
+    private var searchGeneration = 0
+
     func loadBrowseApps() async {
-        guard let s = session, !s.bearer.isEmpty else { return }
+        guard session?.bearer.isEmpty == false else { return }
         if !featuredApps.isEmpty { return }
         isLoading = true
         do {
-            let apps = try await PlayAPI.browse(session: s)
+            let apps = try await withFreshToken { try await PlayAPI.browse(session: $0) }
             self.featuredApps = apps
             self.isLoading = false
         } catch {
@@ -168,7 +200,9 @@ final class PlayStoreManager: ObservableObject {
     }
 
     func search(query: String) async {
-        guard let s = session, !s.bearer.isEmpty else { return }
+        guard session?.bearer.isEmpty == false else { return }
+        searchGeneration += 1
+        let generation = searchGeneration
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty {
             searchResults = []
@@ -177,18 +211,23 @@ final class PlayStoreManager: ObservableObject {
         }
         isSearching = true
         do {
-            let results = try await PlayAPI.search(query: trimmed, session: s)
+            let results = try await withFreshToken { try await PlayAPI.search(query: trimmed, session: $0) }
+            // A slower, older search finishing after a newer one used to overwrite its results.
+            guard generation == searchGeneration else { return }
             self.searchResults = results
             self.isSearching = false
+        } catch is CancellationError {
+            // Typed over: the newer search owns the spinner and the results.
         } catch {
+            guard generation == searchGeneration else { return }
             self.isSearching = false
+            self.errorMessage = "Search failed: \(error.localizedDescription)"
             HuskLog.log("store", "Failed to search '\(query)': \(error.localizedDescription)")
         }
     }
 
     func fetchDetails(for packageName: String) async -> PlayAPI.PlayApp? {
-        guard let s = session, !s.bearer.isEmpty else { return nil }
-        return try? await PlayAPI.details(packageName: packageName, session: s)
+        try? await withFreshToken { try await PlayAPI.details(packageName: packageName, session: $0) }
     }
 
     // MARK: - Download & Install Flow

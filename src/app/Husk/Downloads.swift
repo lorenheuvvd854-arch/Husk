@@ -123,9 +123,12 @@ final class Downloads: ObservableObject {
         // A served folder answers its root with a manifest; so may any link that returns JSON listing files.
         if let manifest = await Self.fetchManifest(url) {
             if !url.absoluteString.hasSuffix("/") { url = url.appendingPathComponent("") }
-            let files = manifest.files.map { f -> File in
+            // compactMap, not a force unwrap: the paths come from whatever server the link points at, and one that does not form a
+            // URL should cost that file, not the app.
+            let files = manifest.files.compactMap { f -> File? in
                 let path = f.path.split(separator: "/").map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }.joined(separator: "/")
-                return File(path: f.path, url: URL(string: "f/" + path, relativeTo: url)!.absoluteString, size: f.size)
+                guard let fileURL = URL(string: "f/" + path, relativeTo: url) else { return nil }
+                return File(path: f.path, url: fileURL.absoluteString, size: f.size)
             }
             guard !files.isEmpty else { problem = "That folder is empty."; return }
             start(Job(title: manifest.name.isEmpty ? (url.host ?? "Folder") : manifest.name, source: url.absoluteString, kind: .folder, files: files))
